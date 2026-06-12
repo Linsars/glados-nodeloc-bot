@@ -30,7 +30,7 @@ function nlRand(min, max) { return Math.floor(Math.random() * (max - min + 1)) +
 async function nlGetState(userId, env) {
     const raw = await env.GLADOS_DB.get(`NL_STATE_${userId}`);
     if (raw) return JSON.parse(raw);
-    return { date: '', readsToday: 0, readTotal: 0, restUntil: 0, lastRead: 0, queue: [] };
+    return { date: '', readsToday: 0, readTotal: 0, totalReadTime: 0, restUntil: 0, lastRead: 0, queue: [], cookieError: '' };
 }
 
 async function nlSaveState(userId, state, env) {
@@ -62,14 +62,18 @@ async function nlReadTopic(cookie, topic) {
         'Pragma': 'no-cache'
     };
     const resp = await fetch(NL_BASE + '/t/' + topic.id, { headers: hdrs });
-    if (!resp.ok) throw new Error('阅读失败 #' + topic.id + ' HTTP ' + resp.status);
-    // 提取 CSRF token（用于 timings API）
+    if (!resp.ok) return { ok: false, cookieError: '', readTime: 0 };
+
+    // 检查 Cookie 是否失效
+    if (resp.headers.get('x-discourse-logged-out') === '1') {
+        return { ok: false, cookieError: 'Cookie 已失效，请重新添加', readTime: 0 };
+    }
+
     const html = await resp.text();
     const csrf = (html.match(/csrf-token" content="([^"]+)"/) || [])[1];
-    // 模拟阅读停留 30-50 秒（原脚本 45-115s，Worker 环境适当缩短）
     const readTime = nlRand(30000, 50000);
     await nlSleep(readTime);
-    // 调用 Discourse timings API 上报阅读时长
+
     if (csrf) {
         try {
             await fetch(NL_BASE + '/t/' + topic.id + '/timings', {
@@ -88,8 +92,8 @@ async function nlReadTopic(cookie, topic) {
             });
         } catch(e) {}
     }
-    // 返回首页
     await fetch(NL_BASE + '/', { headers: { ...hdrs, 'Referer': NL_BASE + '/t/' + topic.id } });
+    return { ok: true, cookieError: '', readTime };
 }
 
 // 获取今日 NodeLoc 统计
@@ -101,10 +105,12 @@ async function nlGetDailyStats(userId, env) {
         return {
             readsToday: isToday ? state.readsToday : 0,
             readTotal: state.readTotal || 0,
-            restUntil: (state.restUntil || 0) > Date.now() ? state.restUntil : 0
+            totalReadTime: Math.round((state.totalReadTime || 0) / 60), // 转分钟
+            restUntil: (state.restUntil || 0) > Date.now() ? state.restUntil : 0,
+            cookieError: state.cookieError || ''
         };
     } catch(e) {
-        return { readsToday: 0, readTotal: 0, restUntil: 0 };
+        return { readsToday: 0, readTotal: 0, totalReadTime: 0, restUntil: 0, cookieError: '' };
     }
 }
 
@@ -143,10 +149,16 @@ async function runNodelocBatch(userId, cookie, env) {
             }
 
             const topic = state.queue.shift();
-            await nlReadTopic(cookie, topic);
+            const result = await nlReadTopic(cookie, topic);
+            if (!result.ok) {
+                if (result.cookieError) state.cookieError = result.cookieError;
+                break;
+            }
             state.readsToday++;
             state.readTotal = (state.readTotal || 0) + 1;
+            state.totalReadTime = (state.totalReadTime || 0) + result.readTime;
             state.lastRead = now;
+            state.cookieError = '';
             readCount++;
 
             // 每帖后 12% 概率休息
@@ -663,10 +675,14 @@ async function executeTask(task, env, origin) {
                 if (type === 'view_all') {
                     const s = await nlGetDailyStats(userId, env);
                     let nlInfo = `├ 🌐 NodeLoc 自动阅读\n├ 📝 今日已读 ${s.readsToday} 帖`;
+                    if (s.totalReadTime > 0) nlInfo += `\n├ ⏱ 累计阅读 ${s.totalReadTime} 分钟`;
                     if (s.readTotal > 0) nlInfo += `\n├ 📚 累计阅读 ${s.readTotal} 帖`;
                     if (s.restUntil > 0) {
                         const mins = Math.ceil((s.restUntil - Date.now()) / 60000);
                         nlInfo += `\n├ 💤 休息中（剩余 ${mins} 分钟）`;
+                    }
+                    if (s.cookieError) {
+                        nlInfo += `\n├ ❌ ${s.cookieError}`;
                     }
                     msgs.push(`〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n[${i+1}/${accounts.length}] 👤 ${maskEmail(acc.email, pref.showEmail)}\n${nlInfo}`);
                 }
@@ -769,7 +785,10 @@ async function handleScheduled(env) {
             let nlLine = '';
             if (nlStats.readsToday > 0) {
                 nlLine = `\n🌐 NodeLoc 今日已阅读 ${nlStats.readsToday} 帖`;
-                if (nlStats.readTotal > 0) nlLine += `（累计 ${nlStats.readTotal}）`;
+                if (nlStats.totalReadTime > 0) nlLine += `（${nlStats.totalReadTime} 分钟）`;
+            }
+            if (nlStats.cookieError) {
+                nlLine += `\n⚠️ NodeLoc: ${nlStats.cookieError}`;
             }
             await tgSend(userId, `⏰ <b>定时签到自动完成</b>\n已在后台成功向 ${gladosCount} 个账号发送了签到指令。${nlLine}`, env);
         }
