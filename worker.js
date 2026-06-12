@@ -222,7 +222,26 @@ export default {
             };
             return new Response(JSON.stringify(diag, null, 2), { headers: { 'Content-Type': 'application/json' } });
         }
-        return new Response('GLaDOS Bot 链式驱动引擎正常运行中。');
+        // 根路径：自动激活 Webhook + 显示状态
+        const setupResult = { webhook: false, commands: false };
+        if (env.BOT_TOKEN) {
+            try {
+                const wh = `${url.protocol}//${url.hostname}/webhook`;
+                const r1 = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/setWebhook?url=${wh}`);
+                setupResult.webhook = (await r1.json()).ok === true;
+                const commands = [{ command: "start", description: "启动/重置机器人菜单" }];
+                const r2 = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/setMyCommands`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commands })
+                });
+                setupResult.commands = (await r2.json()).ok === true;
+            } catch (e) { setupResult.error = e.message; }
+        }
+        return new Response(JSON.stringify({
+            status: 'running',
+            webhook: setupResult.webhook ? '✅ 已激活' : '❌ 未激活（请配置 BOT_TOKEN）',
+            commands: setupResult.commands ? '✅ 已注册' : '⚠️ 未注册',
+            note: '发送 /start 开始使用'
+        }, null, 2), { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
     },
 
     async scheduled(event, env, ctx) {
